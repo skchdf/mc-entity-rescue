@@ -88,9 +88,10 @@ python3 -m unittest discover -s tests
 |------|------|
 | Java 1.16.5（Anvil + 区块内 `Level.Entities`） | ✅ 实战验证（本工具的出处） |
 | NBT 全部 13 种标签、gzip / zlib / 未压缩三种区块压缩 | ✅ 支持，写回保真 |
-| 1.17+ 实体拆分到 `entities/` 目录 | ✅ 代码支持（同为 Anvil 格式），未实战 |
-| 1.18+ 去 `Level` 层、键名 `entities` 小写 | ✅ 代码支持，未实战 |
-| 1.21.x `dimensions/minecraft/*` 新布局 | ✅ 代码支持，未实战 |
+| 1.17+ 实体拆分到 `entities/` 目录（20w45a） | ✅ 代码支持（同为 Anvil 格式），未实战 |
+| 1.18+ 去 `Level` 层、生成中区块键名 `entities` 小写（21w43a） | ✅ 代码支持，未实战 |
+| 26.1+ `dimensions/minecraft/*` 新布局、数据包/模组自定义维度 | ✅ 代码支持，未实战 |
+| 超 1 MiB 的大区块（外部 `c.x.z.mcc` 文件） | ✅ 代码支持，未实战 |
 | 基岩版 | ❌ 不支持（格式完全不同） |
 
 > 改存档前请自己先备份。工具自带的自动备份是第二道保险，不是第一道。

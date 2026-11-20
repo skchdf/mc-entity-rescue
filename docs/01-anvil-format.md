@@ -87,7 +87,7 @@ if offset == 0:
 
 ```
 4 字节   length        后续数据的总长度（含压缩类型字节）
-1 字节   压缩类型      1=gzip, 2=zlib, 3=不压缩
+1 字节   压缩类型      1=gzip, 2=zlib, 3=不压缩；若 |= 0x80 见下文 .mcc
 其余     压缩后的 NBT
 ```
 
@@ -95,11 +95,23 @@ if offset == 0:
 
 ```python
 f.seek(offset)
-length = struct.unpack(">I", f.read(4))[0]
-comp = f.read(1)[0]
-payload = f.read(length - 1)
+head = f.read(5)                       # 长度 + 压缩类型一起读，先判截断
+length = struct.unpack(">I", head[:4])[0]
+comp = head[4]
+if comp & 0x80:                        # 超 255 扇区的区块：数据在外部文件
+    payload = open("c.%d.%d.mcc" % (lx, lz), "rb").read()
+    comp &= 0x7F
+else:
+    payload = f.read(length - 1)
 raw = zlib.decompress(payload) if comp == 2 else payload
 ```
+
+**`.mcc` 外部文件**：单个区块压缩后超过 1020 KiB（255 个扇区）时，扇区数
+那 1 字节就装不下了。Anvil 的官方做法是：槽位只写一个 `length=1`、压缩
+字节 `原值 | 0x80` 的占位，真正的压缩数据放进同目录的
+`c.<区块局部x>.<区块局部z>.mcc`（只含压缩数据本体，没有长度头）。
+什么时候会触发？"往一个区块塞了几万个实体"的时候——对实体抢救工具来说，
+最大的区块恰恰是最该抢救的区块，不会读 `.mcc` 就等于看不见要救的东西。
 
 ---
 
@@ -124,6 +136,10 @@ def save_region(path, chunks, stamps):
         comp, payload = chunks[i]
         data = struct.pack(">I", len(payload) + 1) + bytes([comp]) + payload
         sectors = (len(data) + 4095) // 4096      # 向上取整到扇区
+        if sectors > 255:                         # 1 字节装不下：转存外部 .mcc
+            open("c.%d.%d.mcc" % (i % 32, i // 32), "wb").write(payload)
+            data = struct.pack(">I", 1) + bytes([comp | 0x80])
+            sectors = 1
         struct.pack_into(">I", header, i*4, (next_off << 8) | sectors)
         struct.pack_into(">I", header, 4096 + i*4, stamps.get(i, 0))
         body += data
@@ -138,7 +154,9 @@ def save_region(path, chunks, stamps):
 
 三个容易踩的坑：
 
-- **扇区数上限 255**（1 字节装不下）。正常区块远达不到，除非你往一个区块塞了几万个实体。
+- **扇区数上限 255**（1 字节装不下）。正常区块远达不到——除非你往一个区块
+  塞了几万个实体，那正是实体抢救工具最关心的区块。超出时 Anvil 的官方做法
+  是转存外部 `c.x.z.mcc`（见 2.3），读写都必须处理。
 - **0 字节 `.mca`** 真实存在（空维度、POI 目录里一堆），读头表时必须先检查
   `len(header) < 8192` 就跳过，否则 `struct.unpack` 会直接抛异常。
 - **游戏运行时不要写**。Minecraft 关存档时会整块重写 `.mca`，你在它旁边

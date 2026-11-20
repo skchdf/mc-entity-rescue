@@ -27,8 +27,13 @@ NBT（Named Binary Tag）是 Mojang 自定义的二进制树结构，区块、�
 | 11 | TAG_Int_Array | `list[int]` |
 | 12 | TAG_Long_Array | `list[int]` |
 
-**所有整数都是大端序**。字符串是「UTF-8 + 2 字节无符号长度前缀」，
-没有结尾的 `\0`。
+**所有整数都是大端序**。字符串是「**modified UTF-8** + 2 字节无符号长度
+前缀」，没有结尾的 `\0`。modified UTF-8 与标准 UTF-8 只在一处会咬人：
+**非 BMP 字符（emoji、生僻汉字）不走 4 字节编码，而是拆成两个 UTF-16
+代理项、各写 3 字节**（U+1F600 → `ED A0 BD ED B8 80`）。Python 的
+`utf-8` 解码器拒绝这种字节，所以解析要带 `errors="surrogatepass"`，
+写回同样要用它编码——否则带 emoji 的实体自定义名字会在往返中变成
+`U+FFFD` 乱码，字节也不再一致。
 
 ## 2. 结构布局
 
@@ -114,22 +119,24 @@ def test_write_parse_write_identical(self):
 ```
 0A 00 00                        根 compound，名称空
    08 00 02 69 64               TAG_String "id"
-      00 11 6D 69 ...           长度 17, "minecraft:villager"
+      00 12 6D 69 ...           长度 18, "minecraft:villager"
    0B 00 04 55 55 49 44         TAG_Int_Array "UUID"
       00 00 00 04               4 个 int
       00 00 00 01 00 00 00 02 00 00 00 03 00 00 00 04
-   0A 00 0B 56 69 6C 6C ...     TAG_Compound "VillagerData"
-      08 00 0B 70 72 6F ...     TAG_String "profession"
-         00 11 6D 69 ...        "minecraft:librarian"
+   0A 00 0C 56 69 6C 6C ...     TAG_Compound "VillagerData"
+      08 00 0A 70 72 6F ...     TAG_String "profession"
+         00 13 6D 69 ...        "minecraft:librarian"
       ...
    00                            compound 结束
 ```
 
 几个值得注意的点：
 
-- **实体身份 = UUID**。`UUID`（int[4]，1.9+）或老的 `UUIDMost`/`UUIDLeast`
-  （两个 Long）。本工具两种都认——这是全存档查重防复制的依据。
-- **实体类型 = `id` 字符串**（`minecraft:villager`），1.7.10 及以前是数字。
+- **实体身份 = UUID**。1.16+ 存 `UUID`（int[4]，从高位到低位）；1.16 之前
+  拆成 `UUIDMost`/`UUIDLeast` 两个 Long（UUID = Most<<64 | Least）。
+  本工具两种都认且**归一化成同一表示**——这是全存档查重防复制的依据。
+- **实体类型 = `id` 字符串**（`minecraft:villager`）；1.10 及以前是数字 ID，
+  16w32a（1.11）起才改成字符串。
 - **村民的职业 / 等级 / 类型**打包在 `VillagerData` compound，
   **交易数据**在 `Offers.Recipes` 列表——这些都随实体整体搬运，
   所以"实体级合并"能连交易记录一起救回来。
@@ -166,23 +173,29 @@ def decompress(comp, payload):
 实测把全量扫描从 85 秒降到 23 秒（4 倍多）：
 
 ```python
-_ENT_TAG = b"\x09\x00\x08Entities"
+_ENT_TAG = b"\x09\x00\x08Entities"     # <=1.16 的 Level.Entities / 实体文件根级
+_ENT_TAG_LC = b"\x09\x00\x08entities"  # 21w43a+ 地形区块的小写键名
+
+def _tag_list_all_empty(raw, tag):
+    start = 0
+    while True:
+        i = raw.find(tag, start)
+        if i < 0:
+            return True          # 键名没出现，或所有出现都已确认计数为 0
+        p = i + len(tag)
+        if p + 5 > len(raw) or int.from_bytes(raw[p+1:p+5], "big") != 0:
+            return False         # 非空（或截断看不完）-> 必须完整解析
+        start = i + 1
 
 def entities_empty(raw):
-    start, seen = 0, False
-    while True:
-        i = raw.find(_ENT_TAG, start)
-        if i < 0:
-            return seen        # 见过且全空 -> 跳过；没见过 -> 保守解析
-        seen = True
-        p = i + len(_ENT_TAG)
-        if p + 5 > len(raw) or int.from_bytes(raw[p+1:p+5], "big") != 0:
-            return False       # 有非空列表，必须完整解析
-        start = i + 1
+    return (_tag_list_all_empty(raw, _ENT_TAG) and
+            _tag_list_all_empty(raw, _ENT_TAG_LC))
 ```
 
-**优化必须偏保守**：任何拿不准的情况都返回"需要解析"，宁可慢也不能漏。
-模式可能在方块数据里碰巧出现，所以要检查**所有**出现位置，全部为空才跳过。
+键名一个都没出现也算"空"——1.18+ 完整生成的地形区块通常连实体键都没有，
+这样它们也能走快路径。**优化必须偏保守**：任何拿不准的情况都返回
+"需要解析"，宁可慢也不能漏。模式可能在方块数据里碰巧出现，所以要检查
+**所有**出现位置，全部为空才跳过。
 
 ---
 
