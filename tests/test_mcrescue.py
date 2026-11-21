@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """mcrescue 自测：用合成存档跑通 scan -> recover --apply -> verify 全流程。
 
 不依赖 Minecraft，纯标准库，`python3 -m unittest` 即可运行。
@@ -15,13 +14,21 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mcrescue
 from mcrescue import (
-    Node, write_root, parse_root, save_region, load_region,
-    entity_uuid, entities_empty, parse_chunk_coord, decompress,
+    Node,
+    decompress,
+    entities_empty,
+    entity_uuid,
+    load_region,
+    parse_chunk_coord,
+    parse_root,
+    save_region,
+    write_root,
 )
 
 DATA_VERSION = 2586  # 1.16.5
@@ -184,7 +191,7 @@ class TestNbtRoundtrip(unittest.TestCase):
         raw += b"\x0a\x00\x00"
         raw += b"\x07\x00\x02ba" + struct.pack(">i", 10) + b"\x01\x02"
         raw += b"\x00"
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             parse_root(bytes(raw))
 
     def test_where_coord_math(self):
@@ -237,7 +244,7 @@ class TestRegionIO(unittest.TestCase):
             data = f.read()
         with open(p, "wb") as f:
             f.write(data[:len(data) // 2])
-        chunks, stamps = load_region(p)  # 不应抛异常
+        chunks, _ = load_region(p)  # 不应抛异常
         self.assertIsInstance(chunks, dict)
         self.assertTrue(all(len(v) == 2 for v in chunks.values()))
         shutil.rmtree(tmp, ignore_errors=True)
@@ -389,14 +396,13 @@ class TestEndToEnd(unittest.TestCase):
         self.assertNotIn("(3,3)x", out)
 
     def test_chunk_filter_bad_input(self):
-        code, out, err = run_cli("recover", self.main, self.backup,
-                                 "--chunks", "3,x")
+        code, _, err = run_cli("recover", self.main, self.backup,
+                               "--chunks", "3,x")
         self.assertEqual(code, 2)
         self.assertIn("无法解析 --chunks", err)
 
     def test_corrupt_chunk_does_not_crash_scan(self):
         # 一个坏 zlib 区块：扫描必须跳过它而不是整个崩掉
-        reg = {}
         path = os.path.join(self.main, "region", "r.0.0.mca")
         chunks, stamps = load_region(path)
         chunks[10] = [2, b"definitely-not-a-zlib-stream"]
@@ -518,6 +524,219 @@ class TestRegionLayout(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(main, "region")))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def chunk_nbt_21w43a(cx, cz, villagers, sentinel):
+    """21w43a+ 地形区块：实体列表在根级，键名小写 entities（生成中区块）。"""
+    blocks = Node(12, [sentinel] * 8)
+    return Node(10, [
+        ("DataVersion", Node(3, DATA_VERSION)),
+        ("xPos", Node(3, cx)),
+        ("zPos", Node(3, cz)),
+        ("sections", Node(9, (10, [
+            Node(10, [("Y", Node(1, 4)), ("BlockStates", blocks)]),
+        ]))),
+        ("entities", Node(9, (10, list(villagers)))),
+    ])
+
+
+def write_chunk_raw(save, subdir, gx, gz, node):
+    """直接把一个区块 NBT 写进 <save>/<subdir>/r.0.0.mca（增量）。"""
+    idx = (gx & 31) + (gz & 31) * 32
+    rdir = os.path.join(save, subdir)
+    os.makedirs(rdir, exist_ok=True)
+    path = os.path.join(rdir, "r.0.0.mca")
+    if os.path.exists(path):
+        chunks, stamps = load_region(path)
+    else:
+        chunks, stamps = {}, {}
+    chunks[idx] = [2, zlib.compress(write_root("", node))]
+    stamps[idx] = 1700000000
+    save_region(path, chunks, stamps)
+    return path
+
+
+def read_chunk_root(save, subdir, gx, gz):
+    """读回区块根 Node，以及根级/Level 级各自的键名列表。"""
+    idx = (gx & 31) + (gz & 31) * 32
+    chunks, _ = load_region(os.path.join(save, subdir, "r.0.0.mca"))
+    _, root = parse_root(decompress(*chunks[idx]))
+    level = mcrescue.tag_get(root, "Level")
+    return (
+        root,
+        [n for n, _ in root.v],
+        [n for n, _ in level.v] if level is not None else None,
+    )
+
+
+class TestEntityListKeyInheritance(unittest.TestCase):
+    """主存档缺实体列表时新建列表：键名拼写与宿主位置必须沿用备份区块的
+    实际结构。21w43a+ 地形区块是根级小写 entities，写错大小写游戏会静默
+    忽略整批实体——工具自身读取时大小写不敏感，不自测根本发现不了。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mcrescue-test-")
+        self.main = os.path.join(self.tmp, "World")
+        self.backup = os.path.join(self.tmp, "World-backup")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_lowercase_root_key_copied_from_backup(self):
+        vill = villager(UIDS[0])
+        # 备份：21w43a+ 地形区块，根级小写 entities，1 只村民
+        write_chunk_raw(self.backup, "region", 3, 2, chunk_nbt_21w43a(3, 2, [vill], 111))
+        # 主存档：同区块存在但没有实体列表（整个 entities 键都没有）
+        bare = chunk_nbt_21w43a(3, 2, [], 999)
+        bare_nolist = Node(10, [(n, v) for n, v in bare.v if n != "entities"])
+        write_chunk_raw(self.main, "region", 3, 2, bare_nolist)
+
+        code, out, _ = run_cli("recover", self.main, self.backup, "--apply")
+        self.assertEqual(code, 0)
+        _, root_keys, level_keys = read_chunk_root(self.main, "region", 3, 2)
+        self.assertIn("entities", root_keys)      # 小写根级——沿用备份
+        self.assertNotIn("Entities", root_keys)   # 不能写错大小写
+        self.assertIsNone(level_keys)             # 不能错挂出 Level
+        self.assertIn("恢复", out)
+
+    def test_level_entities_layout_unchanged(self):
+        # 旧版布局（Level.Entities）：行为不变，键名仍写进 Level 且为大写
+        vill = villager(UIDS[0])
+        write_chunk_raw(self.backup, "region", 3, 2,
+                        chunk_nbt(3, 2, [vill], 111))
+        # 主存档：Level 存在但没有 Entities 键
+        bare = chunk_nbt(3, 2, [], 999)
+        bare_nolist = Node(10, [(n, v) for n, v in bare.v if n != "Entities"])
+        write_chunk_raw(self.main, "region", 3, 2, bare_nolist)
+
+        code, _, _ = run_cli("recover", self.main, self.backup, "--apply")
+        self.assertEqual(code, 0)
+        _, root_keys, level_keys = read_chunk_root(self.main, "region", 3, 2)
+        self.assertIsNotNone(level_keys)
+        self.assertIn("Entities", level_keys)
+        self.assertNotIn("entities", root_keys)
+
+    def test_new_entity_file_keeps_backup_key_spelling(self):
+        # 20w45a 布局：实体文件根级大写 Entities；主存档整个 entities/ 目录
+        # 缺失 → 以备份区块为底稿新建，键名拼写必须保留
+        vill = villager(UIDS[0])
+        write_chunk_raw(self.backup, "entities", 3, 2, chunk_nbt_21w43a(3, 2, [vill], 111))
+        write_chunk_raw(self.backup, "region", 3, 2, chunk_nbt_21w43a(3, 2, [], 111))
+
+        code, out, _ = run_cli("recover", self.main, self.backup, "--apply")
+        self.assertEqual(code, 0)
+        self.assertIn("将新建实体文件", out)
+        _, root_keys, _ = read_chunk_root(self.main, "entities", 3, 2)
+        self.assertIn("entities", root_keys)      # 底稿来自备份：键名沿用
+        self.assertIn("恢复", out)
+
+
+class TestVerboseSkipStats(unittest.TestCase):
+    """评审#3：启发式捷径跳过的区块必须在 -v 下可见。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mcrescue-test-")
+        self.main = os.path.join(self.tmp, "World")
+        self.backup = os.path.join(self.tmp, "World-backup")
+        write_world(self.backup, {
+            (3, 2): ([villager(UIDS[0])], 111),
+            (3, 3): ([], 222),   # 空实体列表 → 走启发式捷径
+        })
+        write_world(self.main, {
+            (3, 2): ([], 999),
+            (3, 3): ([], 888),
+        })
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_verbose_reports_heuristic_skips(self):
+        code, out, _ = run_cli("scan", self.main, self.backup, "-v")
+        self.assertEqual(code, 0)
+        self.assertIn("扫描跳过统计", out)
+        self.assertIn("启发式判定为空        : 1", out)
+
+    def test_without_verbose_stays_silent(self):
+        code, out, _ = run_cli("scan", self.main, self.backup)
+        self.assertEqual(code, 0)
+        self.assertNotIn("扫描跳过统计", out)
+
+
+class TestDebugReraise(unittest.TestCase):
+    """评审#4：预期内的"数据坏了"静默跳过；非预期异常在 --debug 下抛出。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mcrescue-test-")
+        write_world(self.tmp, {(3, 2): ([villager(UIDS[0])], 111)})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_unexpected_exception_reraised_with_debug(self):
+        boom = RuntimeError("simulated code bug")
+        with mock.patch.object(mcrescue, "decompress", side_effect=boom):  # noqa: SIM117 — 3.9 兼容
+            with self.assertRaises(RuntimeError):
+                mcrescue.index_entities(self.tmp, debug=True)
+
+    def test_unexpected_exception_swallowed_without_debug(self):
+        boom = RuntimeError("simulated code bug")
+        with mock.patch.object(mcrescue, "decompress", side_effect=boom):
+            uuid_map, _, _ = mcrescue.index_entities(self.tmp, debug=False)
+        self.assertEqual(uuid_map, {})  # 区块被当坏数据跳过，不崩
+
+    def test_parse_errors_skipped_even_with_debug(self):
+        # zlib.error 属于 PARSE_ERRORS：即便 --debug 也只跳过，不抛
+        with mock.patch.object(mcrescue, "decompress", side_effect=zlib.error("bad")):
+            uuid_map, _, _ = mcrescue.index_entities(self.tmp, debug=True)
+        self.assertEqual(uuid_map, {})
+
+    def test_chunk_parse_debug_semantics(self):
+        with mock.patch.object(mcrescue, "decompress", side_effect=RuntimeError("bug")):
+            self.assertEqual(mcrescue.chunk_parse(2, b"x", debug=False), (None, None))
+            with self.assertRaises(RuntimeError):
+                mcrescue.chunk_parse(2, b"x", debug=True)
+        # 真坏数据：即使 debug=True 也返回 (None, None)
+        self.assertEqual(mcrescue.chunk_parse(2, b"not-a-zlib-stream", debug=True),
+                         (None, None))
+
+
+class TestExecuteRecoveryErrorPaths(unittest.TestCase):
+    """评审建议#3：执行阶段的错误分支单独覆盖。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mcrescue-test-")
+        self.main = os.path.join(self.tmp, "World")
+        self.backup = os.path.join(self.tmp, "World-backup")
+        write_world(self.backup, {(3, 2): ([villager(UIDS[0])], 111)})
+        write_world(self.main, {(3, 2): ([], 999)})
+        self.vill = ("minecraft:villager", entity_uuid(villager(UIDS[0])))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _targets(self):
+        return {("region", "r.0.0.mca", 3, 2): [self.vill]}
+
+    def test_missing_backup_region_skipped(self):
+        os.remove(os.path.join(self.backup, "region", "r.0.0.mca"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mcrescue.execute_recovery(self.main, self.backup, self._targets(),
+                                           set(), os.path.join(self.tmp, "bk"))
+        self.assertEqual(rc, 0)
+        self.assertIn("备份缺少", buf.getvalue())
+        # 主存档没有被误建
+        self.assertTrue(os.path.exists(os.path.join(self.main, "region", "r.0.0.mca")))
+
+    def test_missing_main_terrain_region_refused(self):
+        os.remove(os.path.join(self.main, "region", "r.0.0.mca"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mcrescue.execute_recovery(self.main, self.backup, self._targets(),
+                                           set(), os.path.join(self.tmp, "bk"))
+        self.assertEqual(rc, 0)
+        self.assertIn("地形文件缺失", buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.main, "region", "r.0.0.mca")))
 
 
 if __name__ == "__main__":

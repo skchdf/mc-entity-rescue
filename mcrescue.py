@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 mcrescue — Minecraft Java 版存档实体抢救工具（零依赖，纯标准库）
 
@@ -48,6 +47,12 @@ PROG = "mcrescue"
 # 永远不需要恢复的实体：掉落物 5 分钟自然消失，且可能已被玩家捡走
 DEFAULT_SKIP_TYPES = {"minecraft:item"}
 
+# 可预期的"数据坏了"异常：救援工具的正确反应是跳过并计数，而不是崩掉整次扫描。
+# 不在此列的异常类型属于代码 bug，--debug 时会原样抛出（见 chunk_parse /
+# index_entities）。
+PARSE_ERRORS = (struct.error, ValueError, IndexError, EOFError,
+                zlib.error, OSError, UnicodeDecodeError)
+
 # 少量常见 DataVersion 对照（仅用于 info 显示，未知版本显示原值）
 DATA_VERSIONS = {
     2566: "1.16", 2586: "1.16.5", 2717: "1.17", 2730: "1.17.1",
@@ -95,19 +100,19 @@ def _read_node(t, d, p):
     if t == 7:
         n = struct.unpack_from(">i", d, p)[0]; p += 4
         if n < 0 or p + n > len(d):
-            raise ValueError("TAG_Byte_Array 长度非法: %d" % n)
+            raise ValueError(f"TAG_Byte_Array 长度非法: {n}")
         return Node(t, d[p:p + n]), p + n
     if t == 8:
         n = struct.unpack_from(">H", d, p)[0]; p += 2
         if p + n > len(d):
-            raise ValueError("TAG_String 长度越界: %d" % n)
+            raise ValueError(f"TAG_String 长度越界: {n}")
         return Node(t, _decode_str(d[p:p + n])), p + n
     if t == 9:
         et = d[p]
         n = struct.unpack_from(">i", d, p + 1)[0]
         p += 5
         if n < 0:
-            raise ValueError("TAG_List 元素数为负: %d" % n)
+            raise ValueError(f"TAG_List 元素数为负: {n}")
         items = []
         for _ in range(n):
             nd, p = _read_node(et, d, p)
@@ -133,15 +138,14 @@ def _read_node(t, d, p):
     if t == 11:
         n = struct.unpack_from(">i", d, p)[0]; p += 4
         if n < 0 or p + 4 * n > len(d):
-            raise ValueError("TAG_Int_Array 长度非法: %d" % n)
-        return Node(t, list(struct.unpack_from(">%di" % n, d, p))), p + 4 * n
+            raise ValueError(f"TAG_Int_Array 长度非法: {n}")
+        return Node(t, list(struct.unpack_from(f">{n}i", d, p))), p + 4 * n
     if t == 12:
         n = struct.unpack_from(">i", d, p)[0]; p += 4
         if n < 0 or p + 8 * n > len(d):
-            raise ValueError("TAG_Long_Array 长度非法: %d" % n)
-        return Node(t, list(struct.unpack_from(">%dq" % n, d, p))), p + 8 * n
-    raise ValueError("未知 NBT 标签类型 %d @ %d" % (t, p))
-
+            raise ValueError(f"TAG_Long_Array 长度非法: {n}")
+        return Node(t, list(struct.unpack_from(f">{n}q", d, p))), p + 8 * n
+    raise ValueError(f"未知 NBT 标签类型 {t} @ {p}")
 
 def parse_root(d):
     """解析一条完整的 NBT（命名根标签）。返回 (name, Node)。"""
@@ -187,13 +191,12 @@ def _write_node(nd, out):
         out.append(b"\x00")
     elif t == 11:
         out.append(struct.pack(">i", len(v)))
-        out.append(struct.pack(">%di" % len(v), *v))
+        out.append(struct.pack(f">{len(v)}i", *v))
     elif t == 12:
         out.append(struct.pack(">i", len(v)))
-        out.append(struct.pack(">%dq" % len(v), *v))
+        out.append(struct.pack(f">{len(v)}q", *v))
     else:
-        raise ValueError("未知 NBT 标签类型 %d" % t)
-
+        raise ValueError(f"未知 NBT 标签类型 {t}")
 
 def write_root(name, node):
     out = [struct.pack(">B", node.t)]
@@ -305,7 +308,7 @@ def load_region(path):
             if comp & 0x80:
                 # 数据在外部 c.x.z.mcc（只含压缩数据本体，无长度头）
                 comp &= 0x7F
-                mcc = os.path.join(ddir, "c.%d.%d.mcc" % (i % 32, i // 32))
+                mcc = os.path.join(ddir, f"c.{i % 32}.{i // 32}.mcc")
                 try:
                     with open(mcc, "rb") as mf:
                         payload = mf.read()
@@ -341,7 +344,7 @@ def save_region(path, chunks, stamps):
         data = struct.pack(">I", len(payload) + 1) + bytes([comp]) + payload
         sectors = (len(data) + 4095) // 4096
         if sectors > 255:
-            mcc = os.path.join(ddir, "c.%d.%d.mcc" % (i % 32, i // 32))
+            mcc = os.path.join(ddir, f"c.{i % 32}.{i // 32}.mcc")
             mcc_tmp = mcc + ".tmp"
             with open(mcc_tmp, "wb") as mf:
                 mf.write(payload)
@@ -419,12 +422,16 @@ def region_files(save_root, sub=None):
             yield s, fn, rx, rz, os.path.join(rdir, fn)
 
 
-def chunk_parse(comp, payload):
+def chunk_parse(comp, payload, debug=False):
     """解压 + 解析一个区块，返回 (根名称, 根Node)；失败返回 (None, None)。"""
     try:
         name, root = parse_root(decompress(comp, payload))
         return name, root
+    except PARSE_ERRORS:
+        return None, None  # 数据坏：救援工具宁可跳过
     except Exception:
+        if debug:
+            raise
         return None, None
 
 
@@ -458,32 +465,56 @@ def entities_empty(raw):
 # 存档级扫描
 # ---------------------------------------------------------------------------
 
-def index_entities(save_root, progress=None):
+def index_entities(save_root, progress=None, verbose=False, debug=False):
     """扫描整个存档的实体。
     返回：
       uuid_map:  {(实体类型, UUID): 首次出现位置 (子目录, 文件名, gx, gz)}
       chunk_map: {(子目录, 文件名, gx, gz): [(实体类型, UUID, 职业), ...]}
       dup_map:   {(实体类型, UUID): [出现位置, ...]}，仅收录出现 >= 2 次的
+
+    verbose=True 时把各类"跳过"的区块数打印出来（含启发式捷径跳过的数量），
+    便于核对有没有因捷径漏掉本该恢复的区块；debug=True 时非预期异常
+    （疑似代码 bug）原样抛出而不是当作坏数据跳过。
     """
     uuid_map, chunk_map, dup_map = {}, {}, {}
+    skipped = {"region": 0, "bad_chunk": 0, "empty": 0, "heuristic": 0, "parse": 0}
     for s, fn, rx, rz, path in region_files(save_root):
         if progress:
-            progress("%s/%s" % (s, fn))
+            progress(f"{s}/{fn}")
         try:
             chunks, _ = load_region(path)
         except OSError:
+            skipped["region"] += 1
             continue  # 读不了的文件直接跳过
         for idx, (comp, payload) in chunks.items():
             try:
                 raw = decompress(comp, payload)
-            except Exception:
+            except PARSE_ERRORS:
+                skipped["bad_chunk"] += 1
                 continue  # 坏区块跳过，不影响其它区块
-            if ((b"Entities" not in raw and b"entities" not in raw)
-                    or entities_empty(raw)):
-                continue  # 无实体或实体列表为空的区块直接跳过（性能）
+            except Exception:
+                if debug:
+                    raise
+                skipped["bad_chunk"] += 1
+                continue
+            if b"Entities" not in raw and b"entities" not in raw:
+                skipped["empty"] += 1
+                continue  # 键名完全不存在：确定无实体
+            if entities_empty(raw):
+                # 字节模式启发式捷径：任何非零计数都会退回完整解析，
+                # 但理论上可能被恰好同形的字节序列骗过——计数并可在
+                # verbose 下核对
+                skipped["heuristic"] += 1
+                continue
             try:
                 _, root = parse_root(raw)
+            except PARSE_ERRORS:
+                skipped["parse"] += 1
+                continue
             except Exception:
+                if debug:
+                    raise
+                skipped["parse"] += 1
                 continue
             _, ents = get_entities_list(root)
             if ents is None:
@@ -501,6 +532,13 @@ def index_entities(save_root, progress=None):
                         dup_map.setdefault(k, [uuid_map[k]]).append(key)
                     else:
                         uuid_map[k] = key
+    if verbose and any(skipped.values()):
+        print("\n扫描跳过统计（这些区块未纳入实体索引）:")
+        print(f"  区域文件不可读        : {skipped['region']}")
+        print(f"  坏区块（解压/解析失败）: {skipped['bad_chunk']}")
+        print(f"  无实体键名            : {skipped['empty']}")
+        print(f"  启发式判定为空        : {skipped['heuristic']}")
+        print(f"  完整解析失败          : {skipped['parse']}")
     return uuid_map, chunk_map, dup_map
 
 
@@ -520,7 +558,7 @@ def cmd_where(args):
     try:
         coords = [int(v) for v in args.block.split(",")]
     except ValueError:
-        print("错误: 无法解析坐标 %r（示例: \"63,58,45\"）" % args.block,
+        print(f"错误: 无法解析坐标 {args.block!r}（示例: \"63,58,45\"）",
               file=sys.stderr)
         return 2
     if len(coords) < 2:
@@ -529,13 +567,12 @@ def cmd_where(args):
     x = coords[0]
     z = coords[2] if len(coords) >= 3 else coords[1]
     cx, cz, rx, rz, idx = parse_chunk_coord(x, z)
-    print("方块坐标   : %s" % args.block)
-    print("区块坐标   : (%d, %d)   [方块范围 x %d..%d, z %d..%d]"
-          % (cx, cz, cx * 16, cx * 16 + 15, cz * 16, cz * 16 + 15))
-    print("区域文件   : r.%d.%d.mca" % (rx, rz))
-    print("表头索引   : %d   (局部(%d, %d))" % (idx, cx & 31, cz & 31))
+    print(f"方块坐标   : {args.block}")
+    print(f"区块坐标   : ({cx}, {cz})   [方块范围 x {cx * 16}..{cx * 16 + 15}, z {cz * 16}..{cz * 16 + 15}]")
+    print(f"区域文件   : r.{rx}.{rz}.mca")
+    print(f"表头索引   : {idx}   (局部({cx & 31}, {cz & 31}))")
     if args.save:
-        path = os.path.join(args.save, "region", "r.%d.%d.mca" % (rx, rz))
+        path = os.path.join(args.save, "region", f"r.{rx}.{rz}.mca")
         if not os.path.exists(path):
             print("区块状态   : 尚未生成")
             return 0
@@ -548,53 +585,53 @@ def cmd_info(args):
     save = args.save
     ld = os.path.join(save, "level.dat")
     if not os.path.exists(ld):
-        print("错误: 找不到 %s（这不像一个存档目录）" % ld, file=sys.stderr)
+        print(f"错误: 找不到 {ld}（这不像一个存档目录）", file=sys.stderr)
         return 2
     try:
         with gzip.open(ld, "rb") as f:
             _, root = parse_root(f.read())
-    except Exception as e:
-        print("错误: level.dat 读取失败: %s" % e, file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — level.dat 任何形式的损坏都归为"读取失败"，不能崩
+        print(f"错误: level.dat 读取失败: {e}", file=sys.stderr)
         return 2
     data = tag_get(root, "Data") or root
     name = tag_get(data, "LevelName")
     dv = tag_get(data, "DataVersion")
     ver = tag_get(data, "Version")
     spawn = (tag_get(data, "SpawnX"), tag_get(data, "SpawnY"), tag_get(data, "SpawnZ"))
-    print("存档       : %s" % save)
+    print(f"存档       : {save}")
     if name is not None:
-        print("名称       : %s" % name.v)
+        print(f"名称       : {name.v}")
     if dv is not None:
         mcver = DATA_VERSIONS.get(dv.v)
-        print("DataVersion: %d%s" % (dv.v, "  (%s)" % mcver if mcver else ""))
+        print(f"DataVersion: {dv.v}{f'  ({mcver})' if mcver else ''}")
     if ver is not None:
         vn = tag_get(ver, "Name")
         if vn is not None:
-            print("版本       : %s" % vn.v)
+            print(f"版本       : {vn.v}")
     if all(s is not None for s in spawn):
-        print("出生点     : (%d, %d, %d)" % tuple(s.v for s in spawn))
+        print(f"出生点     : ({spawn[0].v}, {spawn[1].v}, {spawn[2].v})")
 
     print("\n扫描实体 ...")
-    uuid_map, chunk_map, dup_map = index_entities(save)
+    uuid_map, chunk_map, dup_map = index_entities(save, verbose=args.verbose, debug=args.debug)
     by_type = {}
-    for (et, u), key in uuid_map.items():
+    for (et, u) in uuid_map:
         by_type[et] = by_type.get(et, 0) + 1
     no_uuid = sum(1 for recs in chunk_map.values() for r in recs if r[1] is None)
     total = sum(len(v) for v in chunk_map.values())
-    print("含实体区块 : %d" % len(chunk_map))
-    print("实体总数   : %d（其中无 UUID %d）" % (total, no_uuid))
+    print(f"含实体区块 : {len(chunk_map)}")
+    print(f"实体总数   : {total}（其中无 UUID {no_uuid}）")
     if dup_map:
-        print("重复 UUID  : %d（运行 verify 看详情）" % len(dup_map))
+        print(f"重复 UUID  : {len(dup_map)}（运行 verify 看详情）")
     for et, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
-        print("  %-32s %d" % (et, n))
+        print(f"  {et:<32} {n}")
     return 0
 
 
 def cmd_scan(args):
-    print("索引备份存档: %s" % args.backup)
-    _, b_chunks, _ = index_entities(args.backup)
-    print("索引主存档  : %s" % args.main)
-    m_uuid, _, _ = index_entities(args.main)
+    print(f"索引备份存档: {args.backup}")
+    _, b_chunks, _ = index_entities(args.backup, verbose=args.verbose, debug=args.debug)
+    print(f"索引主存档  : {args.main}")
+    m_uuid, _, _ = index_entities(args.main, verbose=args.verbose, debug=args.debug)
 
     wanted = set(args.types.split(",")) if args.types else None
     skip = set() if args.include_items else DEFAULT_SKIP_TYPES
@@ -617,34 +654,32 @@ def cmd_scan(args):
         print("\n没有发现缺失实体（按当前过滤条件）。")
         return 0
 
-    print("\n发现 %d 只实体缺失，分布在 %d 个区块：" % (missing_total, len(missing_by_chunk)))
+    print(f"\n发现 {missing_total} 只实体缺失，分布在 {len(missing_by_chunk)} 个区块：")
     for key in sorted(missing_by_chunk, key=lambda k: (k[0], k[1], k[2], k[3])):
         s, fn, gx, gz = key
         recs = missing_by_chunk[key]
-        print("\n  %s/%s  全局区块(%d, %d)  方块 x %d..%d, z %d..%d"
-              % (s, fn, gx, gz, gx * 16, gx * 16 + 15, gz * 16, gz * 16 + 15))
+        print(f"\n  {s}/{fn}  全局区块({gx}, {gz})  方块 x {gx * 16}..{gx * 16 + 15}, z {gz * 16}..{gz * 16 + 15}")
         summary = {}
         for et, u, prof in recs:
-            label = et if not prof else "%s(%s)" % (et.split(":")[-1], prof.split(":")[-1])
+            label = et if not prof else "{}({})".format(et.split(":")[-1], prof.split(":")[-1])
             summary[label] = summary.get(label, 0) + 1
         for label, n in sorted(summary.items(), key=lambda kv: -kv[1]):
-            print("      %-40s x%d" % (label, n))
-    print("\n下一步: python3 %s recover %s %s   # 默认只预览，加 --apply 才写盘"
-          % (PROG, args.main, args.backup))
+            print(f"      {label:<40} x{n}")
+    print(f"\n下一步: python3 {PROG} recover {args.main} {args.backup}   # 默认只预览，加 --apply 才写盘")
     return 0
 
 
-def plan_recovery(main_root, backup_root, types_wanted, skip_items):
+def plan_recovery(main_root, backup_root, types_wanted, skip_items, verbose=False, debug=False):
     """计算需要从备份恢复到主存档的实体。
     返回 (targets, stats, main_uuid_map):
       targets: {(子目录, 文件名, gx, gz): [(实体类型, UUID), ...]}
       stats:   各类计数
       main_uuid_map: 主存档的 {(类型, UUID): 位置}，执行阶段沿用，免二次全扫
     """
-    print("索引备份存档: %s" % backup_root)
-    _, b_chunks, _ = index_entities(backup_root)
-    print("索引主存档  : %s" % main_root)
-    m_uuid, _, _ = index_entities(main_root)
+    print(f"索引备份存档: {backup_root}")
+    _, b_chunks, _ = index_entities(backup_root, verbose=verbose, debug=debug)
+    print(f"索引主存档  : {main_root}")
+    m_uuid, _, _ = index_entities(main_root, verbose=verbose, debug=debug)
 
     skip = set() if not skip_items else DEFAULT_SKIP_TYPES
     wanted = types_wanted or None
@@ -666,61 +701,55 @@ def plan_recovery(main_root, backup_root, types_wanted, skip_items):
     return targets, stats, m_uuid
 
 
-def cmd_recover(args):
-    main_root, backup_root = args.main, args.backup
-    types_wanted = set(args.types.split(",")) if args.types else None
-    skip_items = not args.include_items
+def _parse_chunks_filter(spec):
+    """解析 --chunks "3,2;3,3" -> {(gx, gz), ...}；非法时抛 ValueError。"""
+    want = set()
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        a, b = part.split(",")
+        want.add((int(a), int(b)))
+    return want
 
-    targets, stats, m_uuid = plan_recovery(main_root, backup_root, types_wanted, skip_items)
 
-    # 用户显式指定区块时，只处理这些（全局区块坐标 "x,z;x,z"）
-    if args.chunks:
-        want = set()
-        try:
-            for part in args.chunks.split(";"):
-                part = part.strip()
-                if not part:
-                    continue
-                a, b = part.split(",")
-                want.add((int(a), int(b)))
-        except ValueError:
-            print("错误: 无法解析 --chunks %r（示例: \"3,2;3,3\"）" % args.chunks,
-                  file=sys.stderr)
-            return 2
-        targets = {k: v for k, v in targets.items() if (k[2], k[3]) in want}
-        stats["missing"] = sum(len(v) for v in targets.values())
-
-    print("\n恢复计划:")
-    print("  主存档已存在（跳过）: %d" % stats["exists"])
-    print("  无 UUID（跳过）     : %d" % stats["no_uuid"])
-    print("  待恢复              : %d" % stats["missing"])
-    if not targets:
-        print("\n无需任何修改。")
-        return 0
-
+def _group_by_region(targets):
+    """targets -> {("entities", "r.0.0.mca"): [(gx, gz, [(类型, UUID), ...]), ...]}"""
     by_region = {}
     for (s, fn, gx, gz), recs in targets.items():
         by_region.setdefault((s, fn), []).append((gx, gz, recs))
+    return by_region
 
+
+def _print_recovery_plan(targets, stats):
+    """打印恢复计划摘要（含按区域文件的分布）。"""
+    print("\n恢复计划:")
+    print(f"  主存档已存在（跳过）: {stats['exists']}")
+    print(f"  无 UUID（跳过）     : {stats['no_uuid']}")
+    print(f"  待恢复              : {stats['missing']}")
+    if not targets:
+        print("\n无需任何修改。")
+        return
+    by_region = _group_by_region(targets)
     for (s, fn), items in sorted(by_region.items()):
-        print("  %s/%s: " % (s, fn) + ", ".join(
-            "(%d,%d)x%d" % (gx, gz, len(r)) for gx, gz, r in items))
+        print(f"  {s}/{fn}: " + ", ".join(
+            f"({gx},{gz})x{len(r)}" for gx, gz, r in items))
 
-    if not args.apply:
-        print("\n[dry-run] 未写盘。确认无误后加 --apply 执行。")
-        return 0
 
-    # ---- 执行 ----
-    backup_dir = args.backup_dir or os.path.join(
-        os.path.dirname(os.path.abspath(main_root.rstrip("/"))),
-        "mcrescue-backup-%s" % time.strftime("%Y%m%d-%H%M%S"))
+def execute_recovery(main_root, backup_root, targets, m_uuid, backup_dir,
+                     verbose=False, debug=False):
+    """执行恢复计划：把 targets 里的实体从备份合并进主存档并写盘。
+
+    与规划（plan_recovery）分离：本函数只做 IO 与合并，错误分支
+    （备份缺文件、主存档缺地形文件、区块缺半边、解析失败）都在这里，
+    便于单独测试。verbose/debug 透传给区块解析。
+    """
     all_uuids = set()  # 跨区块查重：本次运行内已恢复的 (类型, UUID)
-
-    for (s, fn), items in sorted(by_region.items()):
+    for (s, fn), items in sorted(_group_by_region(targets).items()):
         main_path = os.path.join(main_root, s, fn)
         backup_path = os.path.join(backup_root, s, fn)
         if not os.path.exists(backup_path):
-            print("  !! 备份缺少 %s/%s，跳过" % (s, fn))
+            print(f"  !! 备份缺少 {s}/{fn}，跳过")
             continue
         if os.path.exists(main_path):
             # 自动备份原文件（保留子目录结构）
@@ -728,18 +757,17 @@ def cmd_recover(args):
             os.makedirs(os.path.dirname(bak), exist_ok=True)
             if not os.path.exists(bak):
                 shutil.copy2(main_path, bak)
-                print("已备份 -> %s" % bak)
+                print(f"已备份 -> {bak}")
             m_chunks, m_stamps = load_region(main_path)
         elif is_entity_subdir(s):
             # 1.17+ 实体文件独立于地形：主存档还没有该实体文件时可以新建，
             # 只新建 entities/ 下的文件，不碰任何地形区块
             m_chunks, m_stamps = {}, {}
-            print("  主存档尚无 %s/%s，将新建实体文件" % (s, fn))
+            print(f"  主存档尚无 {s}/{fn}，将新建实体文件")
         else:
             # 地形 region 文件整体缺失 = 主存档根本没有这些区块。
             # 凭空创建会把备份时的地形一并写进去（等于整块回滚），拒绝。
-            print("  !! 主存档尚无 %s/%s（地形文件缺失，为避免整块回滚不新建），跳过"
-                  % (s, fn))
+            print(f"  !! 主存档尚无 {s}/{fn}（地形文件缺失，为避免整块回滚不新建），跳过")
             continue
         c_chunks, _ = load_region(backup_path)
         need = {}
@@ -754,7 +782,7 @@ def cmd_recover(args):
             now = int(time.time())
             for idx in need:
                 if idx in c_chunks:
-                    name, croot = chunk_parse(*c_chunks[idx])
+                    name, croot = chunk_parse(*c_chunks[idx], debug=debug)
                     if croot is None:
                         continue
                     _, cents = get_entities_list(croot)
@@ -766,24 +794,28 @@ def cmd_recover(args):
         changed = False
         for idx, wanted_pairs in sorted(need.items()):
             if idx not in m_chunks:
-                print("  !! %s 区块 #%d 主存档不存在，跳过" % (fn, idx)); continue
+                print(f"  !! {fn} 区块 #{idx} 主存档不存在，跳过"); continue
             if idx not in c_chunks:
-                print("  !! %s 区块 #%d 备份不存在，跳过" % (fn, idx)); continue
+                print(f"  !! {fn} 区块 #{idx} 备份不存在，跳过"); continue
 
-            name, mroot = chunk_parse(*m_chunks[idx])
-            _, croot = chunk_parse(*c_chunks[idx])
+            name, mroot = chunk_parse(*m_chunks[idx], debug=debug)
+            _, croot = chunk_parse(*c_chunks[idx], debug=debug)
             if mroot is None or croot is None:
-                print("  !! %s 区块 #%d 解析失败，跳过" % (fn, idx)); continue
+                print(f"  !! {fn} 区块 #{idx} 解析失败，跳过"); continue
 
-            _, cents = get_entities_list(croot)
+            bhost, cents = get_entities_list(croot)
             if cents is None:
                 continue
-            mlevel, ments = get_entities_list(mroot)
+            _, ments = get_entities_list(mroot)
             if ments is None:
-                # 主存档该区块没有实体列表：新建并挂到 Level（或根）
-                host = tag_get(mroot, "Level") or mroot
+                # 主存档该区块没有实体列表：新建。键名拼写与宿主位置必须
+                # 沿用备份区块的实际结构——21w43a+ 地形区块是根级小写
+                # entities，写错大小写游戏会静默忽略整批实体（而工具自身
+                # 读取时大小写不敏感，自测根本发现不了）。
+                bkey = next((k for k, v in bhost.v if v is cents), None)
+                mhost = mroot if bhost is croot else (tag_get(mroot, "Level") or mroot)
                 ments = Node(9, (10, []))
-                host.v.append(("Entities", ments))
+                mhost.v.append((bkey or "Entities", ments))
 
             added = []
             for ent in list(cents.v[1]):  # 快照遍历，防止边遍历边追加
@@ -805,21 +837,57 @@ def cmd_recover(args):
                 cnt = {}
                 for et, _u in added:
                     cnt[et] = cnt.get(et, 0) + 1
-                print("  %s 区块 #%d: 恢复 %s" % (fn, idx, cnt))
+                print(f"  {fn} 区块 #{idx}: 恢复 {cnt}")
         if changed:
             os.makedirs(os.path.dirname(main_path), exist_ok=True)
             save_region(main_path, m_chunks, m_stamps)
-            print("已写回 %s" % main_path)
+            print(f"已写回 {main_path}")
 
-    print("\n完成。建议运行校验：python3 %s verify %s %s" % (PROG, main_root, backup_root))
+    print(f"\n完成。建议运行校验：python3 {PROG} verify {main_root} {backup_root}")
+    return 0
+
+
+def cmd_recover(args):
+    main_root, backup_root = args.main, args.backup
+    types_wanted = set(args.types.split(",")) if args.types else None
+    skip_items = not args.include_items
+
+    targets, stats, m_uuid = plan_recovery(main_root, backup_root, types_wanted,
+                                           skip_items,
+                                           verbose=args.verbose, debug=args.debug)
+
+    # 用户显式指定区块时，只处理这些（全局区块坐标 "x,z;x,z"）
+    if args.chunks:
+        try:
+            want = _parse_chunks_filter(args.chunks)
+        except ValueError:
+            print(f"错误: 无法解析 --chunks {args.chunks!r}（示例: \"3,2;3,3\"）",
+                  file=sys.stderr)
+            return 2
+        targets = {k: v for k, v in targets.items() if (k[2], k[3]) in want}
+        stats["missing"] = sum(len(v) for v in targets.values())
+
+    _print_recovery_plan(targets, stats)
+    if not targets:
+        return 0
+
+    if not args.apply:
+        print("\n[dry-run] 未写盘。确认无误后加 --apply 执行。")
+        return 0
+
+    backup_dir = args.backup_dir or os.path.join(
+        os.path.dirname(os.path.abspath(main_root.rstrip("/"))),
+        "mcrescue-backup-{}".format(time.strftime("%Y%m%d-%H%M%S")))
+    execute_recovery(main_root, backup_root, targets, m_uuid, backup_dir,
+                     verbose=args.verbose, debug=args.debug)
     return 0
 
 
 def cmd_verify(args):
     print("索引备份存档 ...")
-    b_uuid, _, _ = index_entities(args.backup)
+    b_uuid, _, _ = index_entities(args.backup, verbose=args.verbose, debug=args.debug)
     print("索引主存档 ...")
-    m_uuid, _, m_dups = index_entities(args.main)
+    m_uuid, _, m_dups = index_entities(args.main, verbose=args.verbose, debug=args.debug)
 
     skip = set() if args.include_items else DEFAULT_SKIP_TYPES
     wanted = set(args.types.split(",")) if args.types else None
@@ -841,16 +909,16 @@ def cmd_verify(args):
               if et not in skip and (wanted is None or et in wanted))
     n_m = sum(1 for (et, u) in m_uuid
               if et not in skip and (wanted is None or et in wanted))
-    print("\n备份实体(去重) : %d" % n_b)
-    print("主存档实体(去重): %d" % n_m)
-    print("主存档重复 UUID : %d" % len(dups))
+    print(f"\n备份实体(去重) : {n_b}")
+    print(f"主存档实体(去重): {n_m}")
+    print(f"主存档重复 UUID : {len(dups)}")
     for et, u, keys in dups[:20]:
         shown = " 与 ".join(str(k) for k in dict.fromkeys(keys))
-        print("  重复 %s %s -> %s" % (et, u, shown))
+        print(f"  重复 {et} {u} -> {shown}")
     n_missing = sum(len(v) for v in missing.values())
-    print("备份有主存档没有: %d" % n_missing)
+    print(f"备份有主存档没有: {n_missing}")
     for et, keys in sorted(missing.items()):
-        print("  %-32s x%d   例: %s" % (et, len(keys), keys[0]))
+        print(f"  {et:<32} x{len(keys)}   例: {keys[0]}")
 
     ok = (n_missing == 0 and not dups)
     print("\n结果: %s" % ("通过 ✓" if ok else "存在问题"))
@@ -865,7 +933,14 @@ def build_parser():
         description="Minecraft Java 版存档实体抢救工具（零依赖）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("info", help="查看存档信息与实体统计")
+    # 扫描类子命令共用的诊断开关（info/scan/recover/verify 都会索引实体）
+    diag = argparse.ArgumentParser(add_help=False)
+    diag.add_argument("-v", "--verbose", action="store_true",
+                      help="打印扫描跳过统计（不可读区域/坏区块/启发式跳过等）")
+    diag.add_argument("--debug", action="store_true",
+                      help="非预期异常（疑似代码 bug）原样抛出，而不是当作坏数据跳过")
+
+    sp = sub.add_parser("info", parents=[diag], help="查看存档信息与实体统计")
     sp.add_argument("save")
     sp.set_defaults(func=cmd_info)
 
@@ -874,14 +949,14 @@ def build_parser():
     sp.add_argument("--save", help="存档路径（给出则顺带查区块是否已生成）")
     sp.set_defaults(func=cmd_where)
 
-    sp = sub.add_parser("scan", help="列出备份有、主存档没有的实体")
+    sp = sub.add_parser("scan", parents=[diag], help="列出备份有、主存档没有的实体")
     sp.add_argument("main", help="主存档路径")
     sp.add_argument("backup", help="备份存档路径")
     sp.add_argument("--types", help="只看指定实体类型（逗号分隔，如 minecraft:villager）")
     sp.add_argument("--include-items", action="store_true", help="把掉落物也计入（默认忽略）")
     sp.set_defaults(func=cmd_scan)
 
-    sp = sub.add_parser("recover", help="把备份中缺失的实体合并回主存档")
+    sp = sub.add_parser("recover", parents=[diag], help="把备份中缺失的实体合并回主存档")
     sp.add_argument("main", help="主存档路径")
     sp.add_argument("backup", help="备份存档路径")
     sp.add_argument("--types", help="只恢复指定实体类型（逗号分隔）")
@@ -891,7 +966,7 @@ def build_parser():
     sp.add_argument("--backup-dir", help="原文件备份目录（默认存档同级 mcrescue-backup-时间戳）")
     sp.set_defaults(func=cmd_recover)
 
-    sp = sub.add_parser("verify", help="校验恢复结果：无缺失、无重复")
+    sp = sub.add_parser("verify", parents=[diag], help="校验恢复结果：无缺失、无重复")
     sp.add_argument("main")
     sp.add_argument("backup")
     sp.add_argument("--types", help="只校验指定实体类型（逗号分隔）")
