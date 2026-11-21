@@ -6,7 +6,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest 已是 26.04，setup-python 不再提供 3.9；锁 22.04
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ["3.9", "3.12", "3.14"]
